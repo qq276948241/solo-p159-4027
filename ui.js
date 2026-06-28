@@ -132,7 +132,8 @@ function renderPlayerSeat(seat, isPlayer = false, activeHandIdx = -1) {
 
     let statusTags = [];
     if (h.folded) statusTags.push(chalk.gray('[弃牌]'));
-    if (isBlackjack(handArr)) statusTags.push(chalk.bgYellow.black(' BLACKJACK '));
+    const isRealBlackjack = isBlackjack(handArr) && !h.fromSplit && !h.isSplitHand;
+    if (isRealBlackjack) statusTags.push(chalk.bgYellow.black(' BLACKJACK '));
     else if (isBust(handArr)) statusTags.push(chalk.bgRed.white(' BUST '));
     if (h.doubledDown) statusTags.push(chalk.magenta('[双倍]'));
     if (h.fromSplit || h.isSplitHand) statusTags.push(chalk.cyan('[分牌]'));

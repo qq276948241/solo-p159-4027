@@ -11,6 +11,11 @@ const {
 const DECKS_PER_SHOE = 6;
 const RESHUFFLE_AT = 52;
 
+function isHandBlackjack(h) {
+  if (!h || !h.hand) return false;
+  return isBlackjack(h.hand) && !h.fromSplit && !h.isSplitHand;
+}
+
 function createGameContext() {
   const ctx = {
     deck: [],
@@ -126,6 +131,7 @@ async function handleSplit(ctx, seat, hand, handIdx, personalityLabel, cb) {
   hand.fromSplit = true;
   hand.isSplitHand = true;
   hand.splitAces = isAces;
+  hand.hasBlackjack = false;
 
   const card1 = ctx.drawWithCount();
   hand.hand.push(card1);
@@ -156,7 +162,7 @@ async function handleSplit(ctx, seat, hand, handIdx, personalityLabel, cb) {
 }
 
 async function runPlayerHand(ctx, player, hand, handIdx, cb) {
-  if (hand.folded || hand.hasBlackjack || hand.isBust || hand.done) return;
+  if (hand.folded || isHandBlackjack(hand) || hand.isBust || hand.done) return;
 
   const splitAcesDone = hand.splitAces && hand.hand.length > 2;
   if (splitAcesDone) return;
@@ -251,7 +257,7 @@ async function runPlayerTurn(ctx, player, cb) {
 }
 
 async function runNPCHand(ctx, npc, hand, handIdx, dealerUp, cb) {
-  if (hand.folded || hand.hasBlackjack || hand.isBust || hand.done) return;
+  if (hand.folded || isHandBlackjack(hand) || hand.isBust || hand.done) return;
   const splitAcesDone = hand.splitAces && hand.hand.length > 2;
   if (splitAcesDone) return;
 
@@ -344,8 +350,8 @@ async function runDealerTurn(ctx, player, npcs, dealer, cb) {
   cb.revealDealer();
   dealer.hand[0].faceUp = true;
 
-  const playerActive = player.hands.some(h => !h.folded && !h.isBust && !h.hasBlackjack);
-  const npcActive = npcs.some(n => n.hands.some(h => !h.folded && !h.isBust && !h.hasBlackjack));
+  const playerActive = player.hands.some(h => !h.folded && !h.isBust && !isHandBlackjack(h));
+  const npcActive = npcs.some(n => n.hands.some(h => !h.folded && !h.isBust && !isHandBlackjack(h)));
   const anyActive = playerActive || npcActive;
 
   cb.onRequestRefresh();
@@ -384,7 +390,7 @@ async function runDealerTurn(ctx, player, npcs, dealer, cb) {
 function settleHand(h, dealerValue, dealerBlackjack, dealerBust) {
   if (h.folded) return 0;
   const seatValue = handValueAll(h.hand);
-  const seatBlackjack = isBlackjack(h.hand) && !h.fromSplit;
+  const seatBlackjack = isHandBlackjack(h);
   const seatBust = isBust(h.hand);
 
   let profit = 0;
@@ -458,5 +464,6 @@ module.exports = {
   createGameContext,
   runRound,
   handleSplit,
-  settleHand
+  settleHand,
+  isHandBlackjack
 };
