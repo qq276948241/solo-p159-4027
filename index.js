@@ -1,17 +1,16 @@
 const readline = require('readline');
 const chalk = require('chalk');
 const {
-  createDeck, shuffle, drawCard, handValueAll,
-  isBlackjack, isBust, getHiLoCount, canSplit, isSplitAces
-} = require('./cards');
-const {
   NPC_PERSONALITIES, MIN_BET, MAX_BET,
-  createNPC, decideBet, decideAction, decideSplit, getPersonalityLabel
+  createNPC, decideBet
 } = require('./npcs');
 const {
   loadSave, saveSave, addHistory, takeLoan,
-  repayLoan, canAffordLoan, needsRepayment, getLoanInfo
+  repayLoan, canAffordLoan, needsRepayment
 } = require('./storage');
+const {
+  createGameContext, runRound
+} = require('./game');
 const {
   renderTable, renderStatusBar, renderHelp,
   renderHistory, clearScreen, print
@@ -29,12 +28,8 @@ const NPC_CONFIGS = [
   { name: '算师', personality: NPC_PERSONALITIES.CARD_COUNTER, chips: 2000 }
 ];
 
-const DECKS_PER_SHOE = 6;
-const RESHUFFLE_AT = 52;
-
 let gameState = {
-  deck: [],
-  runningCount: 0,
+  ctx: null,
   saveData: loadSave(),
   player: null,
   npcs: [],
@@ -42,71 +37,8 @@ let gameState = {
   phase: 'idle',
   message: '',
   gameOver: false,
-  roundBet: 0,
-  playerProfit: 0,
-  playerResult: null,
-  dealerRevealed: false,
-  decksRemaining: DECKS_PER_SHOE,
-  activeHandIdx: 0
+  activeHandIdx: -1
 };
-
-function initShoe() {
-  gameState.deck = shuffle(createDeck(DECKS_PER_SHOE));
-  gameState.runningCount = 0;
-  gameState.decksRemaining = DECKS_PER_SHOE;
-}
-
-function newRound() {
-  if (gameState.deck.length <= RESHUFFLE_AT) {
-    initShoe();
-    gameState.message = '🔄 牌堆已重新洗牌';
-  }
-
-  gameState.dealerRevealed = false;
-  gameState.playerProfit = 0;
-  gameState.playerResult = null;
-  gameState.activeHandIdx = 0;
-
-  gameState.player = {
-    name: '你',
-    personality: null,
-    chips: gameState.saveData.chips,
-    hands: [],
-    bet: 0,
-    folded: false,
-    hasSplit: false,
-    lastProfit: gameState.player ? gameState.player.lastProfit : 0,
-    loanDue: gameState.saveData.loanTaken ? gameState.saveData.loanAmount : 0
-  };
-
-  gameState.npcs = NPC_CONFIGS.map(cfg => {
-    const npc = createNPC(cfg.name, cfg.personality, cfg.chips);
-    npc.lastProfit = 0;
-    npc.hands = [];
-    npc.hasSplit = false;
-    return npc;
-  });
-
-  gameState.dealer = {
-    hand: [],
-    revealed: false
-  };
-
-  updateDecksRemaining();
-}
-
-function updateDecksRemaining() {
-  gameState.decksRemaining = Math.max(1, Math.floor(gameState.deck.length / 52));
-}
-
-function drawWithCount() {
-  const card = drawCard(gameState.deck);
-  if (card) {
-    gameState.runningCount += getHiLoCount(card);
-    updateDecksRemaining();
-  }
-  return card;
-}
 
 function prompt(question) {
   return new Promise(resolve => {
@@ -120,14 +52,19 @@ function sleep(ms) {
 
 function refreshScreen() {
   clearScreen();
-  const dealerForRender = { ...gameState.dealer, revealed: gameState.dealerRevealed };
-  print(renderTable(gameState.player, gameState.npcs, dealerForRender, gameState.saveData, gameState.activeHandIdx));
+  const dealerForRender = gameState.dealer
+    ? { ...gameState.dealer }
+    : { hand: [], revealed: false };
+  print(renderTable(
+    gameState.player, gameState.npcs, dealerForRender,
+    gameState.saveData, gameState.activeHandIdx
+  ));
   print('');
   print(renderStatusBar(
     gameState.message,
     getPhaseLabel(),
-    gameState.deck.length,
-    gameState.runningCount
+    gameState.ctx ? gameState.ctx.deck.length : 0,
+    gameState.ctx ? gameState.ctx.runningCount : 0
   ));
   print('');
 }
@@ -145,6 +82,23 @@ function getPhaseLabel() {
   }
 }
 
+function makeCallbacks() {
+  return {
+    onPhase(phase) { gameState.phase = phase; },
+    onMessage(msg) { gameState.message = msg; },
+    onRequestRefresh() { refreshScreen(); },
+    setActiveHand(idx) { gameState.activeHandIdx = idx; },
+    revealDealer() { if (gameState.dealer) gameState.dealer.revealed = true; },
+    bindDealer(d) { gameState.dealer = d; },
+    updatePlayerChips(chips) {
+      gameState.saveData.chips = chips;
+    },
+    askPlayer: prompt,
+    showHelp() { print(renderHelp()); },
+    sleep
+  };
+}
+
 async function phaseBetting() {
   gameState.phase = 'betting';
   gameState.message = '请下注，输入 0 进入借贷选项';
@@ -153,8 +107,8 @@ async function phaseBetting() {
   const canLoan = canAffordLoan(gameState.saveData);
 
   for (const npc of gameState.npcs) {
-    const dealerCard = gameState.deck[0] || null;
-    const npcBet = decideBet(npc, dealerCard, gameState.runningCount, gameState.decksRemaining);
+    const dealerCard = gameState.ctx.deck[0] || null;
+    const npcBet = decideBet(npc, dealerCard, gameState.ctx.runningCount, gameState.ctx.decksRemaining);
     npc.bet = npcBet;
     if (npcBet > 0) {
       npc.chips -= npcBet;
@@ -166,10 +120,9 @@ async function phaseBetting() {
   refreshScreen();
 
   while (true) {
-    const loanInfo = getLoanInfo();
     let extraHint = '';
     if (player.chips < MIN_BET && canLoan) {
-      extraHint = chalk.red(` (筹码不足! 可借 $${loanInfo.amount})`);
+      extraHint = chalk.red(` (筹码不足! 可借高利贷)`);
     }
     const betStr = await prompt(
       `下注 [$${MIN_BET} ~ $${Math.min(MAX_BET, player.chips)}]${extraHint}: `
@@ -190,9 +143,7 @@ async function phaseBetting() {
         await saveAndQuit();
         return false;
       }
-      if (loanResult === 'gameover') {
-        return false;
-      }
+      if (loanResult === 'gameover') return false;
       refreshScreen();
       continue;
     }
@@ -215,7 +166,6 @@ async function phaseBetting() {
 
 async function phaseLoan() {
   gameState.phase = 'loan';
-
   if (!canAffordLoan(gameState.saveData)) {
     if (needsRepayment(gameState.saveData)) {
       gameState.message = chalk.bgRed.white(' 你还有未偿还的高利贷，无法再借！ ');
@@ -232,10 +182,10 @@ async function phaseLoan() {
     return 'done';
   }
 
-  const loanInfo = getLoanInfo();
   refreshScreen();
+  const { amount, repayAmount, multiplier } = require('./storage').getLoanInfo();
   print(chalk.bgYellow.black(
-    `\n  ⚠ 高利贷警告 ⚠ 借 $${loanInfo.amount}，下局需还 $${loanInfo.repayAmount}（${loanInfo.multiplier}倍）\n`
+    `\n  ⚠ 高利贷警告 ⚠ 借 $${amount}，下局需还 $${repayAmount}（${multiplier}倍）\n`
   ));
 
   const answer = await prompt('接受高利贷? (y/n): ');
@@ -248,477 +198,66 @@ async function phaseLoan() {
       return 'done';
     }
   }
-
   if (gameState.player.chips < MIN_BET) {
     return triggerGameOver('筹码不足且拒绝借贷');
   }
   return 'done';
 }
 
-async function phaseDealing() {
-  gameState.phase = 'dealing';
-  gameState.message = '发牌中...';
-  refreshScreen();
-  await sleep(400);
+function newRound() {
+  if (gameState.ctx.needsReshuffle()) {
+    gameState.ctx.initShoe();
+    gameState.message = '🔄 牌堆已重新洗牌';
+  }
 
-  const player = gameState.player;
-  player.hands = [{
-    hand: [],
-    bet: player.bet,
+  gameState.player = {
+    name: '你',
+    personality: null,
+    chips: gameState.saveData.chips,
+    hands: [],
+    bet: 0,
     folded: false,
-    doubledDown: false,
-    isBust: false,
-    hasBlackjack: false,
-    fromSplit: false,
-    isSplitHand: false,
-    splitAces: false,
-    done: false
-  }];
+    hasSplit: false,
+    lastProfit: gameState.player ? gameState.player.lastProfit : 0,
+    loanDue: gameState.saveData.loanTaken ? gameState.saveData.loanAmount : 0
+  };
 
-  for (const npc of gameState.npcs) {
-    if (!npc.folded) {
-      npc.hands = [{
-        hand: [],
-        bet: npc.bet,
-        folded: false,
-        doubledDown: false,
-        isBust: false,
-        hasBlackjack: false,
-        fromSplit: false,
-        isSplitHand: false,
-        splitAces: false,
-        done: false
-      }];
-    }
-  }
+  gameState.npcs = NPC_CONFIGS.map(cfg => {
+    const npc = createNPC(cfg.name, cfg.personality, cfg.chips);
+    npc.lastProfit = 0;
+    npc.hands = [];
+    npc.hasSplit = false;
+    return npc;
+  });
 
-  for (let round = 0; round < 2; round++) {
-    if (!player.folded) {
-      player.hands[0].hand.push(drawWithCount());
-    }
-    for (const npc of gameState.npcs) {
-      if (!npc.folded && npc.hands.length > 0) {
-        npc.hands[0].hand.push(drawWithCount());
-      }
-    }
-    gameState.dealer.hand.push(drawWithCount());
-    refreshScreen();
-    await sleep(400);
-  }
-
-  gameState.dealer.hand[0].faceUp = false;
-
-  for (const npc of gameState.npcs) {
-    if (!npc.folded && npc.hands.length > 0) {
-      npc.hands[0].hasBlackjack = isBlackjack(npc.hands[0].hand);
-    }
-  }
-  player.hands[0].hasBlackjack = isBlackjack(player.hands[0].hand);
-
-  if (player.hands[0].hasBlackjack) {
-    gameState.message = chalk.yellow('🎉 玩家拿到 BLACKJACK!');
-  }
-  refreshScreen();
-  await sleep(800);
-  return true;
-}
-
-async function phasePlayerTurn() {
-  gameState.phase = 'player_turn';
-  const player = gameState.player;
-
-  if (player.folded) return true;
-
-  for (let hi = 0; hi < player.hands.length; hi++) {
-    gameState.activeHandIdx = hi;
-    const h = player.hands[hi];
-
-    if (h.folded || h.hasBlackjack || h.isBust || h.done) continue;
-
-    const isSplitAcesHand = h.splitAces && h.hand.length > 2;
-
-    while (true) {
-      const v = handValueAll(h.hand);
-      if (v >= 21) break;
-      if (h.doubledDown) break;
-      if (isSplitAcesHand) break;
-
-      const canDouble = h.hand.length === 2 && player.chips >= h.bet;
-      const canSplitNow = canSplit(h.hand) && player.chips >= h.bet && !player.hasSplit;
-      const handLabel = player.hands.length > 1 ? ` [手牌${hi + 1}]` : '';
-
-      gameState.message = `${handLabel} 选择操作: ${chalk.green('h')}要牌 / ${chalk.green('s')}停牌` +
-        (canDouble ? ` / ${chalk.magenta('d')}加倍` : '') +
-        (canSplitNow ? ` / ${chalk.cyan('p')}分牌` : '') +
-        ` / ${chalk.cyan('help')} / ${chalk.red('q')}uit`;
-      refreshScreen();
-
-      const action = await prompt('你的选择: ');
-
-      if (action === 'help') {
-        print(renderHelp());
-        continue;
-      }
-      if (action === 'q' || action === 'quit') {
-        await saveAndQuit();
-        return false;
-      }
-      if (action === 's' || action === 'stand') {
-        gameState.message = `玩家${handLabel}停牌`;
-        break;
-      }
-      if (action === 'h' || action === 'hit') {
-        const card = drawWithCount();
-        h.hand.push(card);
-        gameState.message = `玩家${handLabel}要了一张: ${card.rank}${card.suit}`;
-        if (isBust(h.hand)) {
-          h.isBust = true;
-          gameState.message = chalk.red(`💥 玩家${handLabel} BUST!`);
-        }
-        refreshScreen();
-        await sleep(500);
-        continue;
-      }
-      if (action === 'd' || action === 'double') {
-        if (!canDouble) {
-          gameState.message = chalk.red('无法加倍下注 (筹码不足或手牌>2张)');
-          continue;
-        }
-        player.chips -= h.bet;
-        h.bet *= 2;
-        h.doubledDown = true;
-        gameState.saveData.chips = player.chips;
-        const card = drawWithCount();
-        h.hand.push(card);
-        gameState.message = chalk.magenta(`⬆ 玩家${handLabel}加倍至 $${h.bet}，得: ${card.rank}${card.suit}`);
-        if (isBust(h.hand)) {
-          h.isBust = true;
-          gameState.message = chalk.red(`💥 玩家${handLabel} BUST!`);
-        }
-        refreshScreen();
-        await sleep(700);
-        break;
-      }
-      if (action === 'p' || action === 'split') {
-        if (!canSplitNow) {
-          gameState.message = chalk.red('无法分牌 (筹码不足 / 非对子 / 已分过牌)');
-          continue;
-        }
-
-        const splitRank = h.hand[0].rank;
-        const isAces = splitRank === 'A';
-
-        player.chips -= h.bet;
-        gameState.saveData.chips = player.chips;
-        player.hasSplit = true;
-
-        const secondCard = h.hand.pop();
-
-        const newHand = {
-          hand: [secondCard],
-          bet: h.bet,
-          folded: false,
-          doubledDown: false,
-          isBust: false,
-          hasBlackjack: false,
-          fromSplit: true,
-          isSplitHand: true,
-          splitAces: isAces,
-          done: false
-        };
-        h.fromSplit = true;
-        h.isSplitHand = true;
-        h.splitAces = isAces;
-
-        const card1 = drawWithCount();
-        h.hand.push(card1);
-
-        const card2 = drawWithCount();
-        newHand.hand.push(card2);
-
-        player.hands.splice(hi + 1, 0, newHand);
-
-        gameState.message = chalk.cyan(
-          `� 玩家分牌! ${splitRank}对拆为两手` +
-          (isAces ? ' (分A只补一张)' : '') +
-          ` | 补牌: ${card1.rank}${card1.suit} / ${card2.rank}${card2.suit}`
-        );
-
-        if (isAces) {
-          h.done = true;
-          newHand.done = true;
-        }
-
-        refreshScreen();
-        await sleep(800);
-        break;
-      }
-
-      gameState.message = chalk.red('无效指令!');
-    }
-  }
-
+  gameState.dealer = { hand: [], revealed: false };
   gameState.activeHandIdx = -1;
-  return true;
 }
 
-async function phaseNPCTurn() {
-  gameState.phase = 'npc_turn';
-
-  for (const npc of gameState.npcs) {
-    if (npc.folded) continue;
-
-    for (let hi = 0; hi < npc.hands.length; hi++) {
-      const h = npc.hands[hi];
-      if (h.folded || h.hasBlackjack || h.isBust || h.done) continue;
-
-      const dealerUp = gameState.dealer.hand[1] || gameState.dealer.hand[0];
-      const personalityLabel = getPersonalityLabel(npc.personality);
-
-      const splitAcesDone = h.splitAces && h.hand.length > 2;
-      if (splitAcesDone) continue;
-
-      let safety = 0;
-      while (safety < 30) {
-        safety++;
-        const v = handValueAll(h.hand);
-        if (v >= 21) break;
-        if (h.doubledDown) break;
-
-        const fakeNpc = {
-          ...npc,
-          hand: h.hand,
-          bet: h.bet,
-          folded: h.folded,
-          doubledDown: h.doubledDown,
-          isBust: h.isBust,
-          hasBlackjack: h.hasBlackjack,
-          hasSplit: npc.hasSplit
-        };
-        const action = decideAction(fakeNpc, dealerUp, gameState.runningCount, gameState.decksRemaining);
-        const handLabel = npc.hands.length > 1 ? ` [手牌${hi + 1}]` : '';
-
-        if (action === 'split') {
-          const splitRank = h.hand[0].rank;
-          const isAces = splitRank === 'A';
-
-          if (canSplit(h.hand) && npc.chips >= h.bet && !npc.hasSplit) {
-            npc.chips -= h.bet;
-            npc.hasSplit = true;
-
-            const secondCard = h.hand.pop();
-            const newHand = {
-              hand: [secondCard],
-              bet: h.bet,
-              folded: false,
-              doubledDown: false,
-              isBust: false,
-              hasBlackjack: false,
-              fromSplit: true,
-              isSplitHand: true,
-              splitAces: isAces,
-              done: false
-            };
-            h.fromSplit = true;
-            h.isSplitHand = true;
-            h.splitAces = isAces;
-
-            const card1 = drawWithCount();
-            h.hand.push(card1);
-            const card2 = drawWithCount();
-            newHand.hand.push(card2);
-
-            npc.hands.splice(hi + 1, 0, newHand);
-
-            gameState.message = chalk.cyan(
-              `🔀 ${npc.name} [${personalityLabel}]${handLabel} 分牌! ${splitRank}对拆开` +
-              (isAces ? ' (分A只补一张)' : '')
-            );
-
-            if (isAces) {
-              h.done = true;
-              newHand.done = true;
-            }
-
-            refreshScreen();
-            await sleep(600);
-            break;
-          } else {
-            continue;
-          }
-        }
-
-        if (action === 'stand') {
-          gameState.message = `${npc.name} [${personalityLabel}]${handLabel} 停牌`;
-          refreshScreen();
-          await sleep(500);
-          break;
-        }
-        if (action === 'hit') {
-          const card = drawWithCount();
-          h.hand.push(card);
-          gameState.message = `${npc.name} [${personalityLabel}]${handLabel} 要牌: ${card.rank}${card.suit}`;
-          if (isBust(h.hand)) {
-            h.isBust = true;
-            gameState.message = chalk.red(`💥 ${npc.name}${handLabel} BUST!`);
-          }
-          refreshScreen();
-          await sleep(500);
-          continue;
-        }
-        if (action === 'double') {
-          if (h.hand.length === 2 && npc.chips >= h.bet) {
-            npc.chips -= h.bet;
-            h.bet *= 2;
-            h.doubledDown = true;
-            const card = drawWithCount();
-            h.hand.push(card);
-            gameState.message = chalk.magenta(`⬆ ${npc.name} [${personalityLabel}]${handLabel} 加倍至 $${h.bet}，得: ${card.rank}${card.suit}`);
-            if (isBust(h.hand)) {
-              h.isBust = true;
-              gameState.message = chalk.red(`💥 ${npc.name}${handLabel} BUST!`);
-            }
-            refreshScreen();
-            await sleep(600);
-            break;
-          } else {
-            gameState.message = `${npc.name} [${personalityLabel}]${handLabel} 停牌`;
-            refreshScreen();
-            await sleep(400);
-            break;
-          }
-        }
-      }
-    }
-  }
-  return true;
-}
-
-async function phaseDealerTurn() {
-  gameState.phase = 'dealer_turn';
-  gameState.dealerRevealed = true;
-  gameState.dealer.hand[0].faceUp = true;
-
-  const playerActive = gameState.player.hands.some(h => !h.folded && !h.isBust && !h.hasBlackjack);
-  const npcActive = gameState.npcs.some(n =>
-    n.hands.some(h => !h.folded && !h.isBust && !h.hasBlackjack)
-  );
-  const anyActive = playerActive || npcActive;
-
-  refreshScreen();
-  await sleep(500);
-
-  if (isBlackjack(gameState.dealer.hand)) {
-    gameState.message = chalk.yellow('💀 庄家 BLACKJACK!');
-    refreshScreen();
-    await sleep(1000);
-    return true;
-  }
-
-  if (!anyActive && !isBlackjack(gameState.dealer.hand)) {
-    gameState.message = '所有玩家爆牌或BJ，庄家无需补牌';
-    refreshScreen();
-    await sleep(500);
-    return true;
-  }
-
-  let safety = 0;
-  while (safety < 30) {
-    safety++;
-    const v = handValueAll(gameState.dealer.hand);
-    if (v >= 17) break;
-
-    const card = drawWithCount();
-    gameState.dealer.hand.push(card);
-    gameState.message = `庄家要牌: ${card.rank}${card.suit}`;
-    if (isBust(gameState.dealer.hand)) {
-      gameState.message = chalk.green('💥 庄家 BUST!');
-    }
-    refreshScreen();
-    await sleep(600);
-  }
-  return true;
-}
-
-function settleHand(h, dealerValue, dealerBlackjack, dealerBust) {
-  if (h.folded) return 0;
-
-  const seatValue = handValueAll(h.hand);
-  const seatBlackjack = isBlackjack(h.hand) && !h.fromSplit;
-  const seatBust = isBust(h.hand);
-
-  let profit = 0;
-
-  if (seatBust) {
-    profit = -h.bet;
-  } else if (seatBlackjack && !dealerBlackjack) {
-    profit = Math.floor(h.bet * 1.5);
-  } else if (dealerBust) {
-    profit = h.bet;
-  } else if (seatBlackjack && dealerBlackjack) {
-    profit = 0;
-  } else if (seatValue > dealerValue) {
-    profit = h.bet;
-  } else if (seatValue < dealerValue) {
-    profit = -h.bet;
-  } else {
-    profit = 0;
-  }
-
-  h.profit = profit;
-  return profit;
-}
-
-async function phaseSettlement() {
+async function phaseSettlement(result) {
   gameState.phase = 'settlement';
+  gameState.saveData.chips = gameState.player.chips;
 
-  const dealerValue = handValueAll(gameState.dealer.hand);
-  const dealerBlackjack = isBlackjack(gameState.dealer.hand);
-  const dealerBust = isBust(gameState.dealer.hand);
-
-  const player = gameState.player;
-  let totalPlayerProfit = 0;
-
-  for (const h of player.hands) {
-    totalPlayerProfit += settleHand(h, dealerValue, dealerBlackjack, dealerBust);
-    player.chips += h.bet + (h.profit || 0);
-  }
-
-  gameState.playerProfit = totalPlayerProfit;
-  gameState.saveData.chips = player.chips;
-
-  for (const npc of gameState.npcs) {
-    let totalNpcProfit = 0;
-    for (const h of npc.hands) {
-      totalNpcProfit += settleHand(h, dealerValue, dealerBlackjack, dealerBust);
-      npc.chips += h.bet + (h.profit || 0);
-    }
-    npc.lastProfit = totalNpcProfit;
-    if (npc.chips < MIN_BET) {
-      npc.chips = 2000;
-    }
-  }
-
-  if (totalPlayerProfit > 0) {
-    gameState.playerResult = 'win';
+  let resultLabel;
+  if (result.totalPlayerProfit > 0) {
+    resultLabel = 'win';
     gameState.saveData.totalWins++;
-    gameState.message = chalk.green(`🎉 你赢了 $${totalPlayerProfit}！`);
-  } else if (totalPlayerProfit < 0) {
-    gameState.playerResult = 'lose';
-    gameState.message = chalk.red(`😢 你输了 $${Math.abs(totalPlayerProfit)}`);
+    gameState.message = chalk.green(`🎉 你赢了 $${result.totalPlayerProfit}！`);
+  } else if (result.totalPlayerProfit < 0) {
+    resultLabel = 'lose';
+    gameState.message = chalk.red(`😢 你输了 $${Math.abs(result.totalPlayerProfit)}`);
   } else {
-    gameState.playerResult = 'push';
+    resultLabel = 'push';
     gameState.message = chalk.gray('⚖ 平局，退还本金');
   }
 
-  const totalBet = player.hands.reduce((s, h) => s + h.bet, 0);
   addHistory(gameState.saveData, {
-    profit: totalPlayerProfit,
-    playerValue: player.hands.map(h => handValueAll(h.hand)).join('/'),
-    dealerValue: dealerValue,
-    bet: totalBet,
-    result: gameState.playerResult,
-    split: player.hasSplit
+    profit: result.totalPlayerProfit,
+    playerValue: result.playerValue,
+    dealerValue: result.dealerValue,
+    bet: result.totalBet,
+    result: resultLabel,
+    split: result.didSplit
   });
   gameState.saveData.totalGames++;
 
@@ -733,11 +272,10 @@ async function phaseSettlement() {
   if (needsRepayment(gameState.saveData)) {
     const ok = repayLoan(gameState.saveData);
     if (!ok) {
-      gameState.saveData.chips = player.chips;
       saveSave(gameState.saveData);
       return triggerGameOver(`无法偿还高利贷 $${gameState.saveData.loanAmount}`);
     }
-    player.chips = gameState.saveData.chips;
+    gameState.player.chips = gameState.saveData.chips;
     gameState.message = chalk.green(`✅ 已偿还高利贷，剩余筹码: $${gameState.saveData.chips}`);
     refreshScreen();
     await sleep(1000);
@@ -784,14 +322,12 @@ async function saveAndQuit() {
 
 async function gameLoop() {
   clearScreen();
-  initShoe();
+  gameState.ctx = createGameContext();
 
-  if (gameState.saveData.chips < MIN_BET) {
-    if (!canAffordLoan(gameState.saveData)) {
-      gameState.player = { chips: gameState.saveData.chips, hands: [], bet: 0, lastProfit: 0 };
-      await triggerGameOver('筹码不足且无借贷资格');
-      return;
-    }
+  if (gameState.saveData.chips < MIN_BET && !canAffordLoan(gameState.saveData)) {
+    gameState.player = { chips: gameState.saveData.chips, hands: [], bet: 0, lastProfit: 0 };
+    await triggerGameOver('筹码不足且无借贷资格');
+    return;
   }
 
   while (true) {
@@ -800,25 +336,28 @@ async function gameLoop() {
     refreshScreen();
     print(renderHistory(gameState.saveData.history));
 
-    const steps = [
-      phaseBetting, phaseDealing, phasePlayerTurn,
-      phaseNPCTurn, phaseDealerTurn, phaseSettlement
-    ];
+    const betOk = await phaseBetting();
+    if (betOk === false) break;
+    if (betOk === 'gameover') break;
 
-    let cont = true;
-    for (const step of steps) {
-      cont = await step();
-      if (cont === false || cont === 'gameover') break;
+    const cb = makeCallbacks();
+    const roundResult = await runRound(gameState.ctx, {
+      player: gameState.player,
+      npcs: gameState.npcs,
+      callbacks: cb
+    });
+
+    if (roundResult.quit) {
+      await saveAndQuit();
+      break;
     }
 
-    if (cont === 'gameover' || gameState.gameOver) break;
-    if (cont === false) break;
+    const settleResult = await phaseSettlement(roundResult);
+    if (settleResult === 'gameover') break;
 
-    if (gameState.saveData.chips < MIN_BET) {
-      if (!canAffordLoan(gameState.saveData)) {
-        await triggerGameOver('筹码耗尽且无借贷资格');
-        break;
-      }
+    if (gameState.saveData.chips < MIN_BET && !canAffordLoan(gameState.saveData)) {
+      await triggerGameOver('筹码耗尽且无借贷资格');
+      break;
     }
 
     print('');
