@@ -1,4 +1,4 @@
-const { handValueAll, isBlackjack, isBust } = require('./cards');
+const { handValueAll, isBlackjack, isBust, canSplit, isSplitAces } = require('./cards');
 
 const MIN_BET = 10;
 const MAX_BET = 500;
@@ -79,6 +79,14 @@ function decideAction(npc, dealerUpCard, runningCount, decksRemaining) {
   const dealerValue = dealerUpCard ? (dealerUpCard.rank === 'A' ? 11 :
     ['J', 'Q', 'K'].includes(dealerUpCard.rank) ? 10 : parseInt(dealerUpCard.rank, 10)) : 0;
 
+  const pairRank = npc.hand.length === 2 && npc.hand[0].rank === npc.hand[1].rank ? npc.hand[0].rank : null;
+  const canSplitHand = canSplit(npc.hand) && npc.chips >= npc.bet && !npc.hasSplit;
+
+  if (canSplitHand) {
+    const splitDecision = decideSplit(npc, pairRank, dealerValue, runningCount, decksRemaining);
+    if (splitDecision) return 'split';
+  }
+
   switch (npc.personality) {
     case NPC_PERSONALITIES.AGGRESSIVE: {
       if (myValue <= 11) return 'hit';
@@ -155,6 +163,44 @@ function decideAction(npc, dealerUpCard, runningCount, decksRemaining) {
   }
 }
 
+function decideSplit(npc, pairRank, dealerValue, runningCount, decksRemaining) {
+  const trueCount = decksRemaining > 0 ? runningCount / decksRemaining : 0;
+
+  switch (npc.personality) {
+    case NPC_PERSONALITIES.AGGRESSIVE: {
+      if (pairRank === 'A') return true;
+      if (pairRank === '8') return true;
+      if (['9', '7', '6', '3', '2'].includes(pairRank) && Math.random() < 0.7) return true;
+      if (['J', 'Q', 'K', '10'].includes(pairRank) && Math.random() < 0.4) return true;
+      if (pairRank === '4' || pairRank === '5') return Math.random() < 0.2;
+      return false;
+    }
+
+    case NPC_PERSONALITIES.CONSERVATIVE: {
+      if (pairRank === 'A') return true;
+      if (pairRank === '8') return true;
+      return false;
+    }
+
+    case NPC_PERSONALITIES.CARD_COUNTER: {
+      if (pairRank === 'A') return true;
+      if (pairRank === '8') return true;
+      if (pairRank === '9' && dealerValue !== 7 && dealerValue <= 9) return true;
+      if (pairRank === '9' && dealerValue === 7) return false;
+      if (pairRank === '7' && dealerValue >= 2 && dealerValue <= 7 && trueCount >= 0) return true;
+      if (pairRank === '6' && dealerValue >= 2 && dealerValue <= 6 && trueCount >= 0) return true;
+      if (pairRank === '3' && dealerValue >= 2 && dealerValue <= 7 && trueCount >= 1) return true;
+      if (pairRank === '2' && dealerValue >= 2 && dealerValue <= 7 && trueCount >= 1) return true;
+      if (pairRank === '4' && dealerValue >= 5 && dealerValue <= 6 && trueCount >= 2) return true;
+      if (['J', 'Q', 'K', '10', '5'].includes(pairRank)) return false;
+      return false;
+    }
+
+    default:
+      return pairRank === 'A' || pairRank === '8';
+  }
+}
+
 function getPersonalityLabel(personality) {
   switch (personality) {
     case NPC_PERSONALITIES.AGGRESSIVE: return '激进';
@@ -180,6 +226,7 @@ module.exports = {
   createNPC,
   decideBet,
   decideAction,
+  decideSplit,
   getPersonalityLabel,
   getPersonalityEmoji
 };

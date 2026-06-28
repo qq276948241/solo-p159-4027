@@ -80,6 +80,17 @@ function isBust(hand) {
   return handValueAll(hand) > 21;
 }
 
+function canSplit(hand) {
+  if (hand.length !== 2) return false;
+  const v0 = cardValue(hand[0]);
+  const v1 = cardValue(hand[1]);
+  return v0 === v1;
+}
+
+function isSplitAces(hand) {
+  return hand.length === 2 && hand[0].rank === 'A' && hand[1].rank === 'A';
+}
+
 function getHiLoCount(card) {
   if (!card.faceUp) return 0;
   const rank = card.rank;
@@ -100,5 +111,7 @@ module.exports = {
   handValueAll,
   isBlackjack,
   isBust,
+  canSplit,
+  isSplitAces,
   getHiLoCount
 };

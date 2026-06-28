@@ -1,5 +1,5 @@
 const chalk = require('chalk');
-const { handValue, handValueAll, isBlackjack, isBust, SUIT_COLORS } = require('./cards');
+const { handValue, handValueAll, isBlackjack, isBust, SUIT_COLORS, canSplit } = require('./cards');
 const { getPersonalityLabel, getPersonalityEmoji } = require('./npcs');
 const { getLoanInfo } = require('./storage');
 
@@ -98,46 +98,71 @@ function renderDealer(dealer) {
   return [header, ...handLines].join('\n');
 }
 
-function renderPlayerSeat(seat, isPlayer = false) {
-  const handLines = renderHand(seat.hand);
-  const value = handValueAll(seat.hand);
+function renderPlayerSeat(seat, isPlayer = false, activeHandIdx = -1) {
+  const hands = seat.hands || [seat];
+  const output = [];
 
-  let statusTags = [];
-  if (seat.folded) statusTags.push(chalk.gray('[弃牌]'));
-  if (isBlackjack(seat.hand)) statusTags.push(chalk.bgYellow.black(' BLACKJACK '));
-  else if (isBust(seat.hand)) statusTags.push(chalk.bgRed.white(' BUST '));
-  if (seat.doubledDown) statusTags.push(chalk.magenta('[双倍]'));
-
-  let header = '';
+  let nameHeader = '';
   if (isPlayer) {
-    header = chalk.green(bold(`你 (Player)`)) + ' ' + chalk.green(`💰${seat.chips}`);
+    nameHeader = chalk.green(bold(`你 (Player)`)) + ' ' + chalk.green(`💰${seat.chips}`);
   } else {
     const emoji = getPersonalityEmoji(seat.personality);
     const label = getPersonalityLabel(seat.personality);
-    header = chalk.blue(bold(`${emoji} ${seat.name}`)) +
+    nameHeader = chalk.blue(bold(`${emoji} ${seat.name}`)) +
       chalk.gray(` [${label}]`) + ' ' + chalk.green(`💰${seat.chips}`);
   }
 
-  header += '  ' + chalk.yellow(bold(`下注: $${seat.bet}`));
-
-  if (!seat.folded) {
-    header += '  ' + chalk.white(`[点数: ${value}]`);
-  }
-
-  if (statusTags.length > 0) {
-    header += '  ' + statusTags.join(' ');
-  }
+  const totalBet = hands.reduce((s, h) => s + (h.bet || seat.bet || 0), 0);
+  nameHeader += '  ' + chalk.yellow(bold(`下注: $${totalBet}`));
 
   if (seat.lastProfit !== undefined && seat.lastProfit !== null) {
     const profit = seat.lastProfit;
-    if (profit > 0) header += '  ' + chalk.green(`▲+$${profit}`);
-    else if (profit < 0) header += '  ' + chalk.red(`▼$${profit}`);
+    if (profit > 0) nameHeader += '  ' + chalk.green(`▲+$${profit}`);
+    else if (profit < 0) nameHeader += '  ' + chalk.red(`▼$${profit}`);
   }
 
-  return [header, ...handLines].join('\n');
+  output.push(nameHeader);
+
+  for (let hi = 0; hi < hands.length; hi++) {
+    const h = hands[hi];
+    const handLines = renderHand(h.hand || h);
+    const handArr = h.hand || h;
+    const value = handValueAll(handArr);
+    const bet = h.bet || seat.bet || 0;
+
+    let statusTags = [];
+    if (h.folded) statusTags.push(chalk.gray('[弃牌]'));
+    if (isBlackjack(handArr)) statusTags.push(chalk.bgYellow.black(' BLACKJACK '));
+    else if (isBust(handArr)) statusTags.push(chalk.bgRed.white(' BUST '));
+    if (h.doubledDown) statusTags.push(chalk.magenta('[双倍]'));
+    if (h.fromSplit || h.isSplitHand) statusTags.push(chalk.cyan('[分牌]'));
+
+    let handHeader = '';
+    if (hands.length > 1) {
+      const idx = chalk.white(`手牌${hi + 1}`);
+      const active = (hi === activeHandIdx) ? chalk.bgGreen.black(' ◀ 当前 ') : '';
+      handHeader = `  ${idx} ${chalk.yellow(`($${bet})`)} ${active}  `;
+    } else {
+      handHeader = '  ';
+    }
+
+    if (!h.folded) {
+      handHeader += chalk.white(`[点数: ${value}]`);
+    }
+    if (statusTags.length > 0) {
+      handHeader += '  ' + statusTags.join(' ');
+    }
+
+    output.push(handHeader);
+    for (const line of handLines) {
+      output.push('  ' + line);
+    }
+  }
+
+  return output.join('\n');
 }
 
-function renderTable(player, npcs, dealer, saveData) {
+function renderTable(player, npcs, dealer, saveData, activeHandIdx = -1) {
   const output = [];
 
   output.push(renderHeader());
@@ -162,7 +187,7 @@ function renderTable(player, npcs, dealer, saveData) {
   }
 
   output.push(chalk.green('─'.repeat(60)));
-  output.push(renderPlayerSeat(player, true));
+  output.push(renderPlayerSeat(player, true, activeHandIdx));
 
   return output.join('\n');
 }
@@ -185,8 +210,14 @@ function renderHelp() {
   lines.push(chalk.white('  h / hit     - 要牌 (Hit)'));
   lines.push(chalk.white('  s / stand   - 停牌 (Stand)'));
   lines.push(chalk.white('  d / double  - 加倍下注 (Double)'));
-  lines.push(chalk.white('  p / split   - 分牌 (Split, 暂不支持)'));
+  lines.push(chalk.white('  p / split   - 分牌 (Split) — 起手对子可拆为两手'));
   lines.push(chalk.white('  i / insure  - 保险 (Insurance, 暂不支持)'));
+  lines.push('');
+  lines.push(chalk.cyan(bold('  —— 分牌规则 ——')));
+  lines.push(chalk.white('  起手两张同点数牌 → 可分牌，各补一张'));
+  lines.push(chalk.white('  分牌后下注翻倍（每手各一注）'));
+  lines.push(chalk.white('  分A只补一张牌，不可继续要牌'));
+  lines.push(chalk.white('  不可二次分牌'));
   lines.push('');
   lines.push(chalk.cyan(bold('  —— NPC 性格 ——')));
   lines.push(chalk.white('  🔥 激进 - 爱加注，风险偏好高'));
